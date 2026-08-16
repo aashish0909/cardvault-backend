@@ -2,7 +2,7 @@
 # The web PWA is served from the same origin as the relay, so the browser app
 # needs no CORS and no VITE_RELAY_URL - its /v1/* calls hit Caddy directly.
 
-app.example.com {
+vault.betterstatement.com {
 	encode gzip zstd
 
 	# Relay API (TLS-terminated here; relay itself listens on 127.0.0.1:8787).
