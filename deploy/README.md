@@ -89,6 +89,9 @@ details/OTP, enable web push once.
   production. `server/vapid.json` is generated for local dev only and must
   never be copied to the server. Rotating VAPID keys invalidates existing
   web-push subscriptions (clients re-subscribe on next unlock).
+- `VAPID_SUBJECT` must be a real `https:` or `mailto:` URI that you own.
+  Apple's push service returns 403 for placeholders like `mailto:…@*.local`,
+  and iPhone lock-screen banners never appear.
 - `TRUST_PROXY=1` is required behind Caddy so rate limits use the real client
   IP. Leave it unset if the relay is reached directly.
 - Update flow: rebuild web -> rsync dist; relay: rsync server dir ->
