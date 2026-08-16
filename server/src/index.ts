@@ -1,7 +1,8 @@
 // CardVault relay - zero-knowledge blob mailbox.
 //
 // What this server DOES:
-//   - registers device push tokens (so the app can be pinged)
+//   - registers device push tokens / web-push subscriptions (persisted on disk
+//     so a restart can still ping phones)
 //   - holds opaque, end-to-end encrypted blobs addressed to a device
 //   - hands blobs over on pickup and deletes them immediately
 //   - expires anything not picked up within its TTL
