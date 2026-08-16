@@ -167,6 +167,62 @@ async function cryptoTests(): Promise<void> {
   assert.notEqual(await pairingFingerprint(alice.pubHex, randomPub), ab);
   console.log('ok - pairing fingerprint is a shared two-key safety number');
 
+  // Cancel can be delivered before the original request blob. The owner must
+  // not be left with a still-pending approve/deny row.
+  {
+    const me = await getIdentity();
+    const { ctx, peers, requests } = memoryCtx();
+    const peerId = 'peer-device-1';
+    peers.set(peerId, {
+      id: peerId,
+      name: 'Peer',
+      publicKey: me.pubHex,
+      direction: 'in',
+      status: 'paired',
+    });
+    const requestId = 'req-cancel-first';
+    const cancelPayload = await sealTo(
+      JSON.stringify({ requestId, cardId: 'card-1', kind: 'details' }),
+      me.pubHex
+    );
+    const requestPayload = await sealTo(
+      JSON.stringify({ requestId, cardId: 'card-1' }),
+      me.pubHex
+    );
+    await handleIncomingBlob(
+      { id: 'b1', from: peerId, kind: 'request-cancel', payload: cancelPayload },
+      ctx
+    );
+    assert.equal(requests.get(requestId)?.status, 'cancelled');
+    await handleIncomingBlob(
+      { id: 'b2', from: peerId, kind: 'details-request', payload: requestPayload },
+      ctx
+    );
+    assert.equal(requests.get(requestId)?.status, 'cancelled');
+    console.log('ok - cancel before details-request does not leave a pending request');
+
+    const requestId2 = 'req-then-cancel';
+    const requestPayload2 = await sealTo(
+      JSON.stringify({ requestId: requestId2, cardId: 'card-1' }),
+      me.pubHex
+    );
+    const cancelPayload2 = await sealTo(
+      JSON.stringify({ requestId: requestId2, cardId: 'card-1', kind: 'details' }),
+      me.pubHex
+    );
+    await handleIncomingBlob(
+      { id: 'b3', from: peerId, kind: 'details-request', payload: requestPayload2 },
+      ctx
+    );
+    assert.equal(requests.get(requestId2)?.status, 'pending');
+    await handleIncomingBlob(
+      { id: 'b4', from: peerId, kind: 'request-cancel', payload: cancelPayload2 },
+      ctx
+    );
+    assert.equal(requests.get(requestId2)?.status, 'cancelled');
+    console.log('ok - cancel after details-request marks the request cancelled');
+  }
+
   console.log('\nAll e2e crypto tests passed.');
 }
 

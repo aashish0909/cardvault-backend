@@ -91,12 +91,21 @@ export async function registerDevice(): Promise<void> {
   }
 }
 
+async function blobIdFrom(res: Response): Promise<string> {
+  try {
+    const data = (await res.json()) as { id?: unknown };
+    return typeof data.id === 'string' ? data.id : '';
+  } catch {
+    return '';
+  }
+}
+
 export async function sendBlob(
   toDeviceId: string,
   kind: string,
   payload: object,
   ctx: Pick<IncomingCtx, 'getPeer'> = { getPeer: db.getPeer }
-): Promise<void> {
+): Promise<string> {
   const identity = await getIdentity();
   const peer = await ctx.getPeer(toDeviceId);
   if (!peer) throw new Error(`No peer record for ${toDeviceId}`);
@@ -123,9 +132,80 @@ export async function sendBlob(
       body: retry.body,
     });
     if (!res2.ok) throw new Error(`Relay deposit failed: ${res2.status}`);
-    return;
+    return blobIdFrom(res2);
   }
   if (!res.ok) throw new Error(`Relay deposit failed: ${res.status}`);
+  return blobIdFrom(res);
+}
+
+/** Best-effort delete of a blob we deposited and the recipient has not picked up. */
+async function deleteRelayBlob(blobId: string): Promise<void> {
+  const identity = await getIdentity();
+  const path = `/v1/blobs/${blobId}`;
+  const signed = signRequest(identity, 'DELETE', path, '');
+  const res = await fetch(`${getRelayUrl()}${path}`, {
+    method: 'DELETE',
+    headers: signed.headers,
+  });
+  if (res.status === 401) {
+    await registerDevice();
+    const retry = signRequest(await getIdentity(), 'DELETE', path, '');
+    await fetch(`${getRelayUrl()}${path}`, {
+      method: 'DELETE',
+      headers: retry.headers,
+    }).catch(() => null);
+  }
+}
+
+// Outbound request blobs we may still withdraw if the recipient has not
+// picked them up. Cancel also sends a `request-cancel` notice in case they
+// already have the row locally.
+const outboundBlobs = new Map<string, string>();
+const pendingCancels = new Map<
+  string,
+  { peerId: string; cardId: string; kind: db.RequestKind }
+>();
+
+function rememberOutboundBlob(requestId: string, blobId: string): void {
+  if (blobId) outboundBlobs.set(requestId, blobId);
+}
+
+async function withdrawOutboundBlob(requestId: string): Promise<void> {
+  const blobId = outboundBlobs.get(requestId);
+  outboundBlobs.delete(requestId);
+  if (blobId) await deleteRelayBlob(blobId).catch(() => {});
+}
+
+async function deliverCancel(
+  peerId: string,
+  request: { id: string; cardId: string; kind: db.RequestKind },
+  ctx: Pick<IncomingCtx, 'getPeer'>
+): Promise<void> {
+  await sendBlob(
+    peerId,
+    'request-cancel',
+    { requestId: request.id, cardId: request.cardId, kind: request.kind },
+    ctx
+  );
+}
+
+async function flushPendingCancels(
+  ctx: Pick<IncomingCtx, 'getPeer'> = { getPeer: db.getPeer }
+): Promise<void> {
+  if (pendingCancels.size === 0) return;
+  const queued = [...pendingCancels.entries()];
+  for (const [requestId, item] of queued) {
+    try {
+      await deliverCancel(
+        item.peerId,
+        { id: requestId, cardId: item.cardId, kind: item.kind },
+        ctx
+      );
+      pendingCancels.delete(requestId);
+    } catch {
+      // Stay queued; next poll retries.
+    }
+  }
 }
 
 /** Tell every known peer this device's new display name (best effort). */
@@ -148,10 +228,11 @@ export async function sendNameUpdate(
 export async function requestDetails(
   peerId: string,
   cardId: string,
-  ctx: Pick<IncomingCtx, 'insertRequest'> = defaultCtx
+  ctx: Pick<IncomingCtx, 'insertRequest' | 'getPeer'> = defaultCtx
 ): Promise<db.RequestRow> {
   const requestId = Crypto.randomUUID();
-  await sendBlob(peerId, 'details-request', { requestId, cardId });
+  const blobId = await sendBlob(peerId, 'details-request', { requestId, cardId }, ctx);
+  rememberOutboundBlob(requestId, blobId);
   return ctx.insertRequest({
     id: requestId,
     direction: 'out',
@@ -168,10 +249,16 @@ export async function requestOtp(
   cardId: string,
   amount: string,
   merchant: string,
-  ctx: Pick<IncomingCtx, 'insertRequest' | 'listRequests' | 'setRequestStatus'> = defaultCtx
+  ctx: Pick<IncomingCtx, 'insertRequest' | 'listRequests' | 'setRequestStatus' | 'getPeer'> = defaultCtx
 ): Promise<db.RequestRow> {
   const requestId = Crypto.randomUUID();
-  await sendBlob(peerId, 'otp-request', { requestId, cardId, amount, merchant });
+  const blobId = await sendBlob(
+    peerId,
+    'otp-request',
+    { requestId, cardId, amount, merchant },
+    ctx
+  );
+  rememberOutboundBlob(requestId, blobId);
 
   // Requesting a new OTP automatically revokes any still-open OTP window for
   // the same card - the old OTP is no longer valid once a fresh one is asked
@@ -248,9 +335,19 @@ export async function denyRequest(
 /** Borrower withdraws a pending request. */
 export async function cancelRequest(
   request: db.RequestRow,
-  ctx: Pick<IncomingCtx, 'setRequestStatus'> = defaultCtx
+  ctx: Pick<IncomingCtx, 'setRequestStatus' | 'getPeer'> = defaultCtx
 ): Promise<void> {
-  await sendBlob(request.peerId, 'request-cancel', { requestId: request.id });
+  await withdrawOutboundBlob(request.id);
+  try {
+    await deliverCancel(request.peerId, request, ctx);
+    pendingCancels.delete(request.id);
+  } catch {
+    pendingCancels.set(request.id, {
+      peerId: request.peerId,
+      cardId: request.cardId,
+      kind: request.kind,
+    });
+  }
   await ctx.setRequestStatus(request.id, 'cancelled');
 }
 
@@ -261,6 +358,63 @@ export async function revokeRequest(
 ): Promise<void> {
   await sendBlob(request.peerId, 'request-revoke', { requestId: request.id });
   await ctx.setRequestStatus(request.id, 'revoked');
+}
+
+async function recordIncomingRequest(
+  ctx: IncomingCtx,
+  from: string,
+  row: {
+    id: string;
+    cardId: string;
+    kind: db.RequestKind;
+    amount?: string | null;
+    merchant?: string | null;
+  }
+): Promise<'new' | 'exists' | 'withdrawn'> {
+  const existing = await ctx.getRequest(row.id);
+  if (existing) {
+    if (existing.peerId !== from) return 'exists';
+    if (existing.status === 'cancelled') return 'withdrawn';
+    return 'exists';
+  }
+  await ctx.insertRequest({
+    id: row.id,
+    direction: 'in',
+    peerId: from,
+    cardId: row.cardId,
+    kind: row.kind,
+    amount: row.amount,
+    merchant: row.merchant,
+    status: 'pending',
+  });
+  return 'new';
+}
+
+async function applyIncomingCancel(
+  ctx: IncomingCtx,
+  from: string,
+  data: { requestId?: unknown; cardId?: unknown; kind?: unknown }
+): Promise<boolean> {
+  if (typeof data.requestId !== 'string') return false;
+  const peer = await ctx.getPeer(from);
+  if (!peer || peer.status !== 'paired') return false;
+  const existing = await ctx.getRequest(data.requestId);
+  if (existing) {
+    if (existing.peerId !== from) return false;
+    if (existing.status === 'pending') {
+      await ctx.setRequestStatus(data.requestId, 'cancelled');
+    }
+    return true;
+  }
+  await ctx.insertRequest({
+    id: data.requestId,
+    direction: 'in',
+    peerId: from,
+    cardId: typeof data.cardId === 'string' ? data.cardId : '',
+    kind: data.kind === 'otp' ? 'otp' : 'details',
+    status: 'cancelled',
+  });
+  return true;
 }
 
 /**
@@ -362,14 +516,14 @@ export async function handleIncomingBlob(
         }
         const peer = await ctx.getPeer(blob.from);
         if (!peer || peer.status !== 'paired') return null;
-        await ctx.insertRequest({
+        const outcome = await recordIncomingRequest(ctx, blob.from, {
           id: data.requestId,
-          direction: 'in',
-          peerId: blob.from,
           cardId: data.cardId,
           kind: 'details',
-          status: 'pending',
         });
+        if (outcome !== 'new') {
+          return outcome === 'withdrawn' ? 'details request withdrawn' : 'details request exists';
+        }
         void notify(`${peer.name} wants your card details`, 'Open Requests to approve.');
         return `details request from ${peer.name}`;
       }
@@ -385,16 +539,16 @@ export async function handleIncomingBlob(
         if (!peer || peer.status !== 'paired') return null;
         const amount = typeof data.amount === 'string' ? data.amount : null;
         const merchant = typeof data.merchant === 'string' ? data.merchant : null;
-        await ctx.insertRequest({
+        const outcome = await recordIncomingRequest(ctx, blob.from, {
           id: data.requestId,
-          direction: 'in',
-          peerId: blob.from,
           cardId: data.cardId,
           kind: 'otp',
           amount,
           merchant,
-          status: 'pending',
         });
+        if (outcome !== 'new') {
+          return outcome === 'withdrawn' ? 'otp request withdrawn' : 'otp request exists';
+        }
         void notify(
           `${peer.name} requests an OTP`,
           amount ? `₹${amount}${merchant ? ` at ${merchant}` : ''} - open Requests to approve.` : 'Open Requests to approve.'
@@ -457,8 +611,7 @@ export async function handleIncomingBlob(
       }
       case 'request-cancel': {
         const data = JSON.parse(await openFrom(blob.payload));
-        if (typeof data.requestId !== 'string') return null;
-        await ctx.setRequestStatus(data.requestId, 'cancelled');
+        if (!(await applyIncomingCancel(ctx, blob.from, data))) return null;
         return 'request cancelled';
       }
       case 'request-revoke': {
@@ -511,10 +664,27 @@ async function applyBlobs(blobs: RelayBlob[], ctx: IncomingCtx): Promise<number>
   return handled;
 }
 
+// Serialize inbox application so a foreground poll and the long-poll loop
+// cannot apply overlapping batches out of order (cancel vs details-request).
+let applyQueue: Promise<void> = Promise.resolve();
+
+function enqueueApply(blobs: RelayBlob[], ctx: IncomingCtx): Promise<number> {
+  let handled = 0;
+  const run = applyQueue.then(async () => {
+    handled = await applyBlobs(blobs, ctx);
+  });
+  applyQueue = run.then(
+    () => {},
+    () => {}
+  );
+  return run.then(() => handled);
+}
+
 /** Fetch + apply all pending blobs for this device. Returns count handled. */
 export async function pollInbox(
   ctx: IncomingCtx = defaultCtx
 ): Promise<number> {
+  await flushPendingCancels(ctx);
   const identity = await getIdentity();
   const path = `/v1/blobs?deviceId=${identity.deviceId}`;
   const signed = signRequest(identity, 'GET', path, '');
@@ -528,11 +698,11 @@ export async function pollInbox(
     const res2 = await fetch(`${getRelayUrl()}${path}`, { headers: retry.headers }).catch(() => null);
     if (!res2 || !res2.ok) return 0;
     const data2 = (await res2.json()) as { blobs: RelayBlob[] };
-    return applyBlobs(data2.blobs, ctx);
+    return enqueueApply(data2.blobs, ctx);
   }
   if (!res || !res.ok) return 0;
   const data = (await res.json()) as { blobs: RelayBlob[] };
-  return applyBlobs(data.blobs, ctx);
+  return enqueueApply(data.blobs, ctx);
 }
 
 const RETRY_GAP_MS = 3 * 1000;
@@ -555,6 +725,7 @@ async function pollLoop(): Promise<void> {
     const controller = new AbortController();
     pollAbort = controller;
     try {
+      await flushPendingCancels();
       const identity = await getIdentity();
       const path = `/v1/blobs?deviceId=${identity.deviceId}&wait=1`;
       const signed = signRequest(identity, 'GET', path, '');
@@ -569,7 +740,7 @@ async function pollLoop(): Promise<void> {
       }
       if (!res.ok) throw new Error(`Relay poll failed: ${res.status}`);
       const data = (await res.json()) as { blobs: RelayBlob[] };
-      await applyBlobs(data.blobs, defaultCtx);
+      await enqueueApply(data.blobs, defaultCtx);
     } catch {
       if (polling) await sleep(RETRY_GAP_MS);
     }
