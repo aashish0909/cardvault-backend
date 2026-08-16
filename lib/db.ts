@@ -375,7 +375,7 @@ export async function listSharedCards(): Promise<SharedCardRow[]> {
   const rows = await db.getAllAsync<SharedCardDbRow>(
     "SELECT * FROM shared_cards WHERE status != 'removed' ORDER BY created_at DESC"
   );
-  return rows.map((r) => ({
+  const mapped = rows.map((r) => ({
     id: r.id,
     peerId: r.peer_id,
     ownerCardId: r.owner_card_id,
@@ -387,6 +387,25 @@ export async function listSharedCards(): Promise<SharedCardRow[]> {
     status: r.status as SharedCardStatus,
     createdAt: r.created_at,
   }));
+  const seen = new Set<string>();
+  const unique: SharedCardRow[] = [];
+  const extraIds: string[] = [];
+  for (const r of mapped) {
+    const key = `${r.peerId}:${r.ownerCardId}`;
+    if (seen.has(key)) extraIds.push(r.id);
+    else {
+      seen.add(key);
+      unique.push(r);
+    }
+  }
+  if (extraIds.length > 0) {
+    void Promise.all(
+      extraIds.map((id) =>
+        db.runAsync("UPDATE shared_cards SET status = 'removed' WHERE id = ?", [id]).catch(() => {})
+      )
+    );
+  }
+  return unique;
 }
 
 export async function getSharedCard(id: string): Promise<SharedCardRow | null> {
@@ -416,19 +435,32 @@ export async function insertSharedCard(
   }
 ): Promise<void> {
   const db = await getDb();
-  // A re-share arrives as a fresh row, but the recipient's label is their own -
-  // carry it over from the previous row for the same card, if any.
-  const existing = await db.getFirstAsync<{ label: string | null }>(
-    'SELECT label FROM shared_cards WHERE peer_id = ? AND owner_card_id = ? ORDER BY created_at DESC LIMIT 1',
+  const existing = await db.getFirstAsync<{
+    id: string;
+    label: string | null;
+    created_at: number;
+  }>(
+    `SELECT id, label, created_at FROM shared_cards
+     WHERE peer_id = ? AND owner_card_id = ?
+     ORDER BY CASE WHEN status = 'removed' THEN 1 ELSE 0 END, created_at DESC
+     LIMIT 1`,
     [shared.peerId, shared.ownerCardId]
   );
-  const label =
-    shared.label !== undefined ? shared.label : (existing?.label ?? null);
+  const label = shared.label !== undefined ? shared.label : (existing?.label ?? null);
+  const id = existing?.id ?? Crypto.randomUUID();
+  const createdAt = existing?.created_at ?? Date.now();
   await db.runAsync(
     `INSERT INTO shared_cards (id, peer_id, owner_card_id, nickname, network, last4, color, label, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       nickname = excluded.nickname,
+       network = excluded.network,
+       last4 = excluded.last4,
+       color = excluded.color,
+       label = excluded.label,
+       status = excluded.status`,
     [
-      Crypto.randomUUID(),
+      id,
       shared.peerId,
       shared.ownerCardId,
       shared.nickname,
@@ -437,8 +469,12 @@ export async function insertSharedCard(
       shared.color,
       label,
       shared.status,
-      Date.now(),
+      createdAt,
     ]
+  );
+  await db.runAsync(
+    "UPDATE shared_cards SET status = 'removed' WHERE peer_id = ? AND owner_card_id = ? AND id != ?",
+    [shared.peerId, shared.ownerCardId, id]
   );
 }
 
