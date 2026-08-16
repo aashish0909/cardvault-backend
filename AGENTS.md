@@ -1,3 +1,16 @@
 # Expo HAS CHANGED
 
-Read the exact versioned docs at https://docs.expo.dev/versions/v57.0.0/ before writing any code.
+This project is pinned to **SDK 54** (the newest version Expo Go supports). SDK 57 is installed nowhere here — do not use APIs from SDK 55+ (notably `expo-crypto`'s AES helpers do not exist in 54; see `lib/crypto.ts` for the construction in use).
+
+Read the exact versioned docs at https://docs.expo.dev/versions/v54.0.0/ before writing any code.
+
+## Project notes
+
+- **Crypto layers**: `lib/crypto.ts` = AES-256-CBC + HMAC-SHA256 (EtM) for the local vault (crypto-js). `lib/e2e.ts` = tweetnacl crypto_box (X25519 + XSalsa20-Poly1305) for peer-to-peer payloads. `lib/identity.ts` = per-device X25519 keypair in SecureStore.
+- **Relay**: `server/` is a zero-knowledge blob mailbox (Hono). The app derives its URL from the Metro host, so the relay must run on the same machine as `expo start`, reachable on the LAN: `npm run relay` (port 8787, binds all interfaces; production units set `HOST=127.0.0.1`). It never sees plaintext. Pairing: `POST/GET /v1/codes` mints/resolves short-lived 8-char pairing codes (5-min TTL, no ambiguous chars) that map to the public pairing payload (same data as the QR); `lib/pairing.ts` is the client, `app/pair/scan.tsx` has the OTP-style entry, `app/pair/my-qr.tsx` shows the refreshable code.
+- **Relay auth**: every device-touching endpoint requires an Ed25519 request signature (`x-cv-*` headers, `lib/reqsig.ts` + `src/lib/reqsig.ts` on web). The signing seed is `sha256("cardvault-req-v1:" + identity.secretHex)`; the derived public key is bound to the deviceId at first `POST /v1/devices` registration. Canonical string: `cardvault-req-v1\nMETHOD\npath?query\nts\nnonce\nsha256(body)`. Clients retry once through `registerDevice()` on 401. Env: `TRUST_PROXY=1` (trust X-Forwarded-For only behind our proxy), `DEBUG_TOKEN` (gates `/v1/debug`; unset = disabled). See `deploy/` for the Caddy + systemd setup.
+- **Native deps** (expo-barcode-scanner, expo-device, react-native-svg) require a dev-client rebuild after changes: `npm run ios` (locale vars baked in — Homebrew CocoaPods crashes without them).
+- **Node tests**: `scripts/` stubs the Expo modules (tsconfig paths in `scripts/tsconfig.json`). `npm`-less run: `npx tsx --tsconfig scripts/tsconfig.json scripts/crypto.test.ts` and `scripts/e2e.test.ts` (the latter's role modes need the relay running; see the header comment).
+- **Phase 3 scope**: done - details/OTP request flows. Borrower: Request details -> owner picks the reveal window (2/5/10/15 min; lib/reveal.ts, memory-only, owner's choice rides the approve blob as expiresAt) -> Request OTP (amount+merchant) -> OTP relayed with 10-min window. Owner: Requests tab, biometric approve, window picker modal, inline OTP entry. Unfriend: 'pair-decline' blob is sent BEFORE the local peer row is deleted (sendBlob needs the public key), and the receiver removes the peer + all their shared cards.
+- **Request protocol**: blob kinds details-request/approve/deny, otp-request/approve/deny, request-cancel. Requests are correlated by owner card id + shared request id; both sides store a `requests` row.
+- **Phase 4 scope**: remote push, Android SMS auto-capture, revocation edge cases, screenshot blocking, secure-store requireAuthentication in release builds.

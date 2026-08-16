@@ -1,0 +1,48 @@
+# CardVault relay - hardened systemd unit.
+# Install: cp cardvault-relay.service /etc/systemd/system/ && systemctl enable --now cardvault-relay
+
+[Unit]
+Description=CardVault zero-knowledge relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/cardvault/server
+ExecStart=/usr/bin/npx tsx src/index.ts
+
+# --- relay configuration -----------------------------------------------------
+# Loopback only: the relay must be reachable solely through the Caddy proxy.
+Environment=HOST=127.0.0.1
+Environment=PORT=8787
+# We are behind Caddy: trust its X-Forwarded-For for rate limiting.
+Environment=TRUST_PROXY=1
+# Comma-separated browser origins allowed to call the relay cross-origin.
+Environment=CORS_ORIGINS=https://app.example.com
+# VAPID keys (generate once: npx web-push generate-vapid-keys).
+# Never copy server/vapid.json to the server.
+Environment=VAPID_PUBLIC_KEY=REPLACE_ME
+Environment=VAPID_PRIVATE_KEY=REPLACE_ME
+# Leave DEBUG_TOKEN unset in production (disables GET /v1/debug entirely).
+
+# --- hardening ----------------------------------------------------------------
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

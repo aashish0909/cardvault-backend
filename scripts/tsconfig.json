@@ -1,0 +1,16 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "expo-crypto": ["stubs/expo-crypto.ts"],
+      "expo-secure-store": ["stubs/expo-secure-store.ts"],
+      "expo-device": ["stubs/expo-device.ts"],
+      "expo-constants": ["stubs/expo-constants.ts"],
+      "expo-sqlite": ["stubs/expo-sqlite.ts"],
+      "expo-notifications": ["stubs/expo-notifications.ts"],
+      "react-native": ["stubs/react-native.ts"]
+    }
+  },
+  "include": ["**/*.ts", "../lib/**/*.ts"]
+}

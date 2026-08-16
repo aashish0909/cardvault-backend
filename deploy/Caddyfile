@@ -1,0 +1,38 @@
+# CardVault single-server Caddyfile.
+# The web PWA is served from the same origin as the relay, so the browser app
+# needs no CORS and no VITE_RELAY_URL - its /v1/* calls hit Caddy directly.
+
+app.example.com {
+	encode gzip zstd
+
+	# Relay API (TLS-terminated here; relay itself listens on 127.0.0.1:8787).
+	handle /v1/* {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle /health {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	# Static PWA build (cardvault-web/dist).
+	handle {
+		root * /var/www/cardvault
+		try_files {path} /index.html
+		file_server
+
+		# Service worker must always be revalidated; hashed assets are immutable.
+		header /sw.js Cache-Control "no-cache"
+		header /assets/* Cache-Control "public, max-age=31536000, immutable"
+
+		# Security headers (mirrors cardvault-web/netlify.toml).
+		header {
+			Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+			X-Frame-Options "DENY"
+			X-Content-Type-Options "nosniff"
+			Referrer-Policy "no-referrer"
+			Permissions-Policy "camera=(self), microphone=(), geolocation=()"
+			Cross-Origin-Opener-Policy "same-origin"
+			Cross-Origin-Resource-Policy "same-origin"
+			-remove X-Powered-By
+		}
+	}
+}

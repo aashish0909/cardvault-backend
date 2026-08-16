@@ -1,0 +1,24 @@
+{
+  "name": "cardvault-relay",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Zero-knowledge relay for CardVault. Routes opaque E2E-encrypted blobs between devices; stores nothing readable.",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "hono": "^4.13.2",
+    "tweetnacl": "^1.0.3",
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/web-push": "^3.6.4",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}
