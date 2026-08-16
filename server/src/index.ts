@@ -801,7 +801,7 @@ app.get('/v1/blobs', async (c) => {
     };
     const abort = () => finish(false);
     wake = () => finish(true);
-    timer = setTimeout(() => wake(), LONG_POLL_TIMEOUT_MS);
+    timer = setTimeout(() => finish(false), LONG_POLL_TIMEOUT_MS);
     queued = addWaiter(deviceId, ip, wake);
     if (!queued) {
       finish(false);
