@@ -33,8 +33,10 @@ yarn-error.*
 # local env files
 .env*.local
 
-# relay VAPID keys
+# relay VAPID keys and persisted device registrations
 vapid.json
+devices.json
+devices.json.tmp
 
 # typescript
 *.tsbuildinfo

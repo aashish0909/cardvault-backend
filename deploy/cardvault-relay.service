@@ -30,6 +30,10 @@ Environment=VAPID_PUBLIC_KEY=REPLACE_ME
 Environment=VAPID_PRIVATE_KEY=REPLACE_ME
 # Leave DEBUG_TOKEN unset in production (disables GET /v1/debug entirely).
 
+# Writable state: device registrations + web-push subscriptions (ProtectSystem=strict
+# otherwise blocks writes). systemd sets STATE_DIRECTORY automatically.
+StateDirectory=cardvault-relay
+
 # --- hardening ----------------------------------------------------------------
 Restart=always
 RestartSec=3

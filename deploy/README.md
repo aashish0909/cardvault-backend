@@ -80,9 +80,11 @@ details/OTP, enable web push once.
 
 ## Operational notes
 
-- All relay state is in-memory by design: a restart drops device
-  registrations and pending blobs; clients re-register automatically on
-  their next signed request (401 -> register -> retry).
+- Device registrations (push tokens / web-push subscriptions) are persisted
+  under systemd's `StateDirectory` (`/var/lib/cardvault-relay/devices.json`)
+  so a relay restart still knows how to ping phones. Pending blobs stay
+  in-memory: a restart drops undelivered mail; clients re-register
+  automatically on their next signed request (401 -> register -> retry).
 - VAPID keys **must** come from `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` in
   production. `server/vapid.json` is generated for local dev only and must
   never be copied to the server. Rotating VAPID keys invalidates existing
