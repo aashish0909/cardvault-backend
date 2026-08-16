@@ -74,7 +74,7 @@ export default function PairScanScreen() {
     }
     setPending({
       payload: parsed,
-      fingerprint: await pairingFingerprint(parsed.pub),
+      fingerprint: await pairingFingerprint(identity.pubHex, parsed.pub),
     });
     setState('confirm');
     setMessage('');
@@ -176,8 +176,9 @@ export default function PairScanScreen() {
       {state === 'confirm' && pending && (
         <View style={styles.manualBox}>
           <Text style={styles.manualLabel}>
-            Compare this fingerprint with the number on {pending.payload.name}'s
-            screen. If they differ, do not pair.
+            Send the request, then compare this fingerprint with the number on{' '}
+            {pending.payload.name}'s screen. Both of you see a number made from
+            both keys, so they must match. If they differ, do not pair.
           </Text>
           <Text style={styles.fingerprint}>{pending.fingerprint}</Text>
           <View style={styles.confirmRow}>
@@ -191,7 +192,7 @@ export default function PairScanScreen() {
               <Text style={styles.codeButtonText}>Cancel</Text>
             </Pressable>
             <Pressable style={styles.acceptButton} onPress={() => void confirmPair()}>
-              <Text style={styles.acceptText}>Fingerprints match</Text>
+              <Text style={styles.acceptText}>Send request</Text>
             </Pressable>
           </View>
         </View>
@@ -262,6 +263,15 @@ export default function PairScanScreen() {
       {state === 'done' && (
         <View style={styles.doneBanner}>
           <Text style={styles.doneText}>{message}</Text>
+          {pending && (
+            <>
+              <Text style={styles.manualLabel}>
+                Keep this number visible — it must match the fingerprint on{' '}
+                {pending.payload.name}'s pairing request.
+              </Text>
+              <Text style={styles.fingerprint}>{pending.fingerprint}</Text>
+            </>
+          )}
           <Pressable style={styles.doneButton} onPress={() => router.back()}>
             <Text style={styles.doneButtonText}>Done</Text>
           </Pressable>

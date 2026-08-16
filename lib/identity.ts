@@ -87,11 +87,22 @@ export function pairingPayload(identity: Identity): string {
   });
 }
 
-/** Short visual fingerprint of the public key for human verification. */
-export async function pairingFingerprint(pubHex: string): Promise<string> {
+/**
+ * Safety number for a pairing. Both devices hash the same two public keys
+ * (sorted, so order does not matter), then show the first 8 hex chars.
+ * Comparing this out of band catches a relay swapping keys.
+ *
+ * Must stay in lockstep with the web app's `pairingFingerprint`.
+ */
+export async function pairingFingerprint(
+  pubHexA: string,
+  pubHexB: string
+): Promise<string> {
+  const [a, b] = [pubHexA.toLowerCase(), pubHexB.toLowerCase()].sort();
   const digest = await Crypto.digestStringAsync(
     Crypto.CryptoDigestAlgorithm.SHA256,
-    pubHex
+    a + b
   );
-  return digest.slice(0, 8).toUpperCase();
+  const hex = digest.slice(0, 8).toUpperCase();
+  return `${hex.slice(0, 4)}-${hex.slice(4)}`;
 }

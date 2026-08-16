@@ -7,7 +7,6 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import {
   getIdentity,
-  pairingFingerprint,
   pairingPayload,
 } from '../../lib/identity';
 import {
@@ -22,7 +21,6 @@ export default function MyQrScreen() {
   const insets = useSafeAreaInsets();
   const [payload, setPayload] = useState<string | null>(null);
   const [name, setName] = useState('');
-  const [fingerprint, setFingerprint] = useState('');
   const [code, setCode] = useState<string | null>(null);
   const [codeError, setCodeError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -42,7 +40,6 @@ export default function MyQrScreen() {
       const identity = await getIdentity();
       setPayload(pairingPayload(identity));
       setName(identity.name);
-      setFingerprint(await pairingFingerprint(identity.pubHex));
     })();
     refreshCode();
   }, [refreshCode]);
@@ -72,9 +69,6 @@ export default function MyQrScreen() {
       </View>
 
       <Text style={styles.name}>{name}</Text>
-      <Text style={styles.fingerprint}>
-        Fingerprint {fingerprint} - tell your friend to check theirs matches.
-      </Text>
 
       <View style={styles.codeBox}>
         <Text style={styles.codeLabel}>
@@ -98,8 +92,9 @@ export default function MyQrScreen() {
 
       <Text style={styles.note}>
         The QR and code contain only your public key, name and device id - your
-        cards never leave this phone. The QR is permanent (it's your public
-        identity); pairing codes expire after {PAIRING_CODE_TTL_MIN} minutes.
+        cards never leave this phone. After they send a request, both of you
+        will see the same fingerprint — compare those numbers before you
+        accept. Pairing codes expire after {PAIRING_CODE_TTL_MIN} minutes.
       </Text>
     </View>
   );
@@ -143,12 +138,6 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     textAlign: 'center',
     marginTop: 20,
-  },
-  fingerprint: {
-    color: colors.muted,
-    fontSize: 13,
-    textAlign: 'center',
-    marginTop: 8,
   },
   codeBox: {
     backgroundColor: colors.surface,

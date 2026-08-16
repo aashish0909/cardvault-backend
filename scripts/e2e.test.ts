@@ -23,7 +23,7 @@ import nacl from 'tweetnacl';
 import * as SecureStore from 'expo-secure-store';
 import { base64Decode, base64Encode, bytesToUtf8, bytesToHex, utf8Bytes } from '../lib/bytes';
 import { sealTo, openFrom } from '../lib/e2e';
-import { generateIdentity, getIdentity } from '../lib/identity';
+import { generateIdentity, getIdentity, pairingFingerprint } from '../lib/identity';
 import { signRequest, signingPublicKeyHex } from '../lib/reqsig';
 import { useRevealStore } from '../lib/reveal';
 import {
@@ -152,6 +152,20 @@ async function cryptoTests(): Promise<void> {
   // envelope is opaque: no plaintext leaks in the sealed payload
   assert.ok(!sealed.includes('world'));
   console.log('ok - no plaintext in sealed envelope');
+
+  const alice = generateIdentity('Alice');
+  const bob = generateIdentity('Bob');
+  const ab = await pairingFingerprint(alice.pubHex, bob.pubHex);
+  const ba = await pairingFingerprint(bob.pubHex, alice.pubHex);
+  assert.equal(ab, ba, 'fingerprint must be order-independent');
+  assert.equal(
+    await pairingFingerprint(alice.pubHex.toUpperCase(), bob.pubHex),
+    ab,
+    'fingerprint must ignore hex case'
+  );
+  assert.match(ab, /^[0-9A-F]{4}-[0-9A-F]{4}$/);
+  assert.notEqual(await pairingFingerprint(alice.pubHex, randomPub), ab);
+  console.log('ok - pairing fingerprint is a shared two-key safety number');
 
   console.log('\nAll e2e crypto tests passed.');
 }

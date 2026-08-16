@@ -23,7 +23,7 @@ import {
   setPeerStatus,
   SharedCardRow,
 } from '../../../lib/db';
-import { pairingFingerprint } from '../../../lib/identity';
+import { getIdentity, pairingFingerprint } from '../../../lib/identity';
 import { sendBlob, useInboxStore } from '../../../lib/relay';
 import { colors } from '../../../lib/theme';
 
@@ -33,7 +33,12 @@ export default function FriendsScreen() {
   const [peers, setPeers] = useState<PeerRow[]>([]);
   const [sharedCards, setSharedCards] = useState<SharedCardRow[]>([]);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [myPub, setMyPub] = useState('');
   const inboxEvent = useInboxStore((s) => s.eventId);
+
+  useEffect(() => {
+    void getIdentity().then((id) => setMyPub(id.pubHex));
+  }, []);
 
   const reload = useCallback(() => {
     listPeers().then(setPeers);
@@ -236,8 +241,8 @@ export default function FriendsScreen() {
                     ? 'Waiting for them to accept'
                     : 'Wants to pair with you'}
                 </Text>
-                {item.section === 'incoming' && (
-                  <FingerprintLine pubHex={item.publicKey} />
+                {!!myPub && (
+                  <FingerprintLine pubHex={item.publicKey} myPub={myPub} outgoing={item.section === 'outgoing'} />
                 )}
               </View>
               {item.section === 'incoming' ? (
@@ -262,16 +267,29 @@ export default function FriendsScreen() {
   );
 }
 
-function FingerprintLine({ pubHex }: { pubHex: string }) {
+function FingerprintLine({
+  pubHex,
+  myPub,
+  outgoing,
+}: {
+  pubHex: string;
+  myPub: string;
+  outgoing: boolean;
+}) {
   const [value, setValue] = useState('');
   useEffect(() => {
-    void pairingFingerprint(pubHex).then(setValue);
-  }, [pubHex]);
+    void pairingFingerprint(myPub, pubHex).then(setValue);
+  }, [myPub, pubHex]);
   if (!value) return null;
   return (
-    <Text style={styles.fingerprint}>
-      Fingerprint {value} — match this with their screen before accepting.
-    </Text>
+    <>
+      <Text style={styles.fingerprintValue}>{value}</Text>
+      <Text style={styles.fingerprint}>
+        {outgoing
+          ? 'They should see this same number on the pairing request.'
+          : 'This must match the number on their screen before you accept.'}
+      </Text>
+    </>
   );
 }
 
@@ -362,10 +380,17 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 2,
   },
+  fingerprintValue: {
+    color: colors.text,
+    fontSize: 18,
+    fontWeight: '700',
+    letterSpacing: 2,
+    marginTop: 8,
+  },
   fingerprint: {
     color: colors.muted,
     fontSize: 12,
-    marginTop: 6,
+    marginTop: 4,
     letterSpacing: 0.4,
   },
   rowActions: {
