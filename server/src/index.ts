@@ -185,7 +185,10 @@ function randomPairingCode(): string {
 // persisted to vapid.json (0600), and reused on restart so stored
 // subscriptions keep working. The public key is served to browsers so they
 // can subscribe.
-const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:relay@cardvault.local';
+// Apple rejects VAPID JWTs whose `sub` is not a real https:/mailto: contact
+// (mailto:…@cardvault.local returns 403 and the lock-screen banner never fires).
+const VAPID_SUBJECT =
+  process.env.VAPID_SUBJECT || 'https://vault.betterstatement.com';
 const VAPID_FILE = new URL('../vapid.json', import.meta.url).pathname;
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 // Device registrations (including web-push subscriptions) survive relay
@@ -291,6 +294,7 @@ if (!vapidFromEnv && (process.env.HOST === '127.0.0.1' || process.env.NODE_ENV =
   );
 }
 loadDevices();
+console.log(`[devices] persist path ${DEVICES_FILE} vapidSubject=${VAPID_SUBJECT}`);
 
 // Push copy for the kinds that warrant waking the user. Everything here is
 // public metadata (kind is visible to the relay anyway); the payload itself is
@@ -309,19 +313,29 @@ const PUSH_TEXT: Record<string, { title: string; body: string } | null> = {
   'request-cancel': { title: 'Request cancelled', body: 'A request was cancelled.' },
   'request-revoke': { title: 'Window revoked', body: 'An approved window was revoked.' },
   'name-update': null,
+  'push-test': { title: 'CardVault', body: 'Notifications are working on this device.' },
 };
 
-async function pushToDevice(device: DeviceRecord, kind: string): Promise<void> {
+function pushHost(device: DeviceRecord): string {
+  try {
+    return device.pushSubscription ? new URL(device.pushSubscription.endpoint).host : 'expo';
+  } catch {
+    return 'invalid';
+  }
+}
+
+/** Returns true when the push service accepted the message. */
+async function pushToDevice(device: DeviceRecord, kind: string): Promise<boolean> {
   const text = PUSH_TEXT[kind] ?? {
     title: 'CardVault',
     body: 'New activity - open the app to review.',
   };
-  if (text === null) return;
+  if (text === null) return false;
   const payload = JSON.stringify({ ...text, kind });
   if (device.platform !== 'web') {
     if (!device.pushToken) {
       console.warn(`[push] platform=${device.platform} kind=${kind} skipped: no expo token`);
-      return;
+      return false;
     }
     try {
       const res = await fetch(EXPO_PUSH_URL, {
@@ -349,15 +363,17 @@ async function pushToDevice(device: DeviceRecord, kind: string): Promise<void> {
         throw new Error(result.data.message ?? 'Expo push rejected');
       }
       console.log(`[push] platform=${device.platform} kind=${kind} delivered`);
+      return true;
     } catch (err) {
       console.error(`[push] platform=${device.platform} kind=${kind} failed: ${(err as Error).message}`);
+      return false;
     }
-    return;
   }
   if (!device.pushSubscription) {
     console.warn(`[push] kind=${kind} skipped: no web-push subscription`);
-    return;
+    return false;
   }
+  const host = pushHost(device);
   try {
     await webpush.sendNotification(device.pushSubscription, payload, {
       // Long enough that a briefly-offline phone still gets the banner;
@@ -365,16 +381,22 @@ async function pushToDevice(device: DeviceRecord, kind: string): Promise<void> {
       TTL: 4 * 60 * 60,
       urgency: 'high',
     });
-    console.log(`[push] kind=${kind} delivered`);
+    console.log(`[push] kind=${kind} host=${host} delivered`);
+    return true;
   } catch (err) {
-    const code = (err as { statusCode?: number }).statusCode;
+    const webErr = err as { statusCode?: number; body?: string; message?: string };
+    const code = webErr.statusCode;
+    const body = typeof webErr.body === 'string' ? webErr.body.slice(0, 300) : '';
     if (code === 404 || code === 410) {
       device.pushSubscription = null; // push service dropped the subscription
       persistDevices();
-      console.warn(`[push] kind=${kind} subscription gone (${code}); cleared`);
+      console.warn(`[push] kind=${kind} host=${host} subscription gone (${code}); cleared`);
     } else {
-      console.error(`[push] kind=${kind} failed: ${(err as Error).message}`);
+      console.error(
+        `[push] kind=${kind} host=${host} failed: ${webErr.message ?? err} status=${code ?? '?'} body=${body}`
+      );
     }
+    return false;
   }
 }
 
@@ -515,6 +537,7 @@ const RATE_LIMITS: Record<string, number> = {
   'DELETE /v1/blobs/:id': 300,
   'POST /v1/devices': 120,
   'GET /v1/push/vapid': 120,
+  'POST /v1/push/test': 30,
   'POST /v1/csp-report': 30,
 };
 
@@ -715,6 +738,21 @@ app.post('/v1/devices', async (c) => {
 
 // VAPID public key for web push subscription.
 app.get('/v1/push/vapid', (c) => c.json({ publicKey: vapidKeys.publicKey }));
+
+// Send a test OS banner to this device so the user can confirm lock-screen
+// delivery without waiting for a friend request.
+app.post('/v1/push/test', async (c) => {
+  const device = authenticatedDevice(c, '');
+  if (!device) return unauthorized(c);
+  const deviceId = c.req.header('x-cv-device');
+  if (deviceId) touchDevice(deviceId);
+  if (!isPushable(device)) {
+    return c.json({ error: 'no push subscription on this device' }, 400);
+  }
+  const ok = await pushToDevice(device, 'push-test');
+  if (!ok) return c.json({ error: 'push service rejected the notification' }, 502);
+  return c.json({ ok: true });
+});
 
 // Create a short-lived pairing code for this device. The relay stores only
 // the public pairing payload (what the QR shows anyway) under a random code.

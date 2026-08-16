@@ -28,6 +28,8 @@ Environment=CORS_ORIGINS=https://vault.betterstatement.com
 # Never copy server/vapid.json to the server.
 Environment=VAPID_PUBLIC_KEY=REPLACE_ME
 Environment=VAPID_PRIVATE_KEY=REPLACE_ME
+# Contact URI embedded in VAPID JWTs. Apple rejects .local mailtos with 403.
+Environment=VAPID_SUBJECT=https://vault.betterstatement.com
 # Leave DEBUG_TOKEN unset in production (disables GET /v1/debug entirely).
 
 # Writable state: device registrations + web-push subscriptions (ProtectSystem=strict
