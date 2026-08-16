@@ -30,10 +30,13 @@ const MAX_PAYLOAD_BYTES = 64 * 1024; // encrypted blobs are small; 64 KB is gene
 const MAX_BODY_BYTES = 128 * 1024; // hard cap on any request body (memory DoS)
 const MAX_BLOBS_PER_DEVICE = 200; // inbox cap per recipient (memory exhaustion)
 const MAX_DEVICES = 10_000; // total registered devices cap
+const DEVICE_STALE_MS = 7 * 24 * 60 * 60 * 1000; // drop unused registrations after 7d
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
 const MAX_TTL_MS = 48 * 60 * 60 * 1000; // 48 h
 const SWEEP_INTERVAL_MS = 60 * 1000;
 const LONG_POLL_TIMEOUT_MS = 25 * 1000; // how long a waiting pickup may hang
+const MAX_WAITERS = 2_000;
+const MAX_WAITERS_PER_IP = 40;
 
 // Request signing: Ed25519 detached signatures over a canonical request
 // string. Timestamps bound replay to a small window; nonces are single-use
@@ -67,6 +70,7 @@ interface DeviceRecord {
   pushSubscription: PushSubscriptionRecord | null;
   platform: 'ios' | 'android' | 'web';
   registeredAt: number;
+  lastSeen: number;
 }
 
 interface PushSubscriptionRecord {
@@ -103,7 +107,72 @@ const seenNonces = new Map<string, number>();
 
 // Long-poll waiters: deviceId -> callbacks held in pending GET /v1/blobs.
 // Deposits wake them so pickups return the moment a blob lands.
-const waiters = new Map<string, Array<() => void>>();
+interface Waiter {
+  wake: () => void;
+  ip: string;
+}
+const waiters = new Map<string, Waiter[]>();
+const waiterCountByIp = new Map<string, number>();
+
+function waiterTotal(): number {
+  let n = 0;
+  for (const list of waiters.values()) n += list.length;
+  return n;
+}
+
+function addWaiter(deviceId: string, ip: string, wake: () => void): boolean {
+  if (waiterTotal() >= MAX_WAITERS) return false;
+  if ((waiterCountByIp.get(ip) ?? 0) >= MAX_WAITERS_PER_IP) return false;
+  const list = waiters.get(deviceId) ?? [];
+  list.push({ wake, ip });
+  waiters.set(deviceId, list);
+  waiterCountByIp.set(ip, (waiterCountByIp.get(ip) ?? 0) + 1);
+  return true;
+}
+
+function removeWaiter(deviceId: string, wake: () => void): void {
+  const list = waiters.get(deviceId);
+  if (!list) return;
+  const i = list.findIndex((w) => w.wake === wake);
+  if (i < 0) return;
+  const [removed] = list.splice(i, 1);
+  if (removed) {
+    const next = (waiterCountByIp.get(removed.ip) ?? 1) - 1;
+    if (next > 0) waiterCountByIp.set(removed.ip, next);
+    else waiterCountByIp.delete(removed.ip);
+  }
+  if (list.length === 0) waiters.delete(deviceId);
+}
+
+function wakeWaiters(deviceId: string): boolean {
+  const pending = waiters.get(deviceId);
+  if (!pending || pending.length === 0) return false;
+  waiters.delete(deviceId);
+  for (const w of pending) {
+    const next = (waiterCountByIp.get(w.ip) ?? 1) - 1;
+    if (next > 0) waiterCountByIp.set(w.ip, next);
+    else waiterCountByIp.delete(w.ip);
+    w.wake();
+  }
+  return true;
+}
+
+function touchDevice(deviceId: string): void {
+  const device = devices.get(deviceId);
+  if (device) device.lastSeen = Date.now();
+}
+
+function randomPairingCode(): string {
+  // Rejection sampling so every alphabet character is equally likely.
+  const out: string[] = [];
+  const bound = Math.floor(256 / CODE_ALPHABET.length) * CODE_ALPHABET.length;
+  while (out.length < 8) {
+    const b = randomBytes(1)[0]!;
+    if (b >= bound) continue;
+    out.push(CODE_ALPHABET[b % CODE_ALPHABET.length]!);
+  }
+  return out.join('');
+}
 
 // --- Web Push (VAPID) ------------------------------------------------------
 // Keys are pinned via env for stability; otherwise they are generated once,
@@ -141,8 +210,14 @@ function loadVapidKeys(): { publicKey: string; privateKey: string } {
   return generated;
 }
 
+const vapidFromEnv = Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
 const vapidKeys = loadVapidKeys();
 webpush.setVapidDetails(VAPID_SUBJECT, vapidKeys.publicKey, vapidKeys.privateKey);
+if (!vapidFromEnv && (process.env.HOST === '127.0.0.1' || process.env.NODE_ENV === 'production')) {
+  console.warn(
+    '[vapid] VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY are unset; file-based keys are for local dev only'
+  );
+}
 
 // Push copy for the kinds that warrant waking the user. Everything here is
 // public metadata (kind is visible to the relay anyway); the payload itself is
@@ -352,14 +427,22 @@ const RATE_LIMITS: Record<string, number> = {
   'DELETE /v1/blobs/:id': 300,
   'POST /v1/devices': 120,
   'GET /v1/push/vapid': 120,
+  'POST /v1/csp-report': 30,
 };
+
+function isPlausibleIp(value: string): boolean {
+  return (
+    /^(?:\d{1,3}\.){3}\d{1,3}$/.test(value) ||
+    (value.includes(':') && value.length <= 45 && !/[\s,]/.test(value))
+  );
+}
 
 function clientIp(c: Context): string {
   if (TRUST_PROXY) {
     const fwd = c.req.header('x-forwarded-for')?.split(',')[0]?.trim();
-    if (fwd) return fwd;
+    if (fwd && isPlausibleIp(fwd)) return fwd;
     const cf = c.req.header('cf-connecting-ip')?.trim();
-    if (cf) return cf;
+    if (cf && isPlausibleIp(cf)) return cf;
   }
   try {
     const info = getConnInfo(c);
@@ -367,7 +450,9 @@ function clientIp(c: Context): string {
   } catch {
     // adapter did not expose conn info
   }
-  return 'local';
+  // Last resort: a shared bucket. Prefer being too strict over trusting a
+  // spoofable forwarding header when TRUST_PROXY is off.
+  return 'unknown';
 }
 
 app.use('*', async (c, next) => {
@@ -436,6 +521,15 @@ setInterval(() => {
 
 app.get('/health', (c) => c.json({ ok: true }));
 
+// Browser CSP violation reports (Caddy report-uri). Metadata only, truncated.
+app.post('/v1/csp-report', async (c) => {
+  const read = await readJsonBody(c);
+  if (read.ok) {
+    console.warn(`[csp] ${read.raw.slice(0, 1500)}`);
+  }
+  return c.body(null, 204);
+});
+
 // Zero-knowledge debug: device/blob counts and metadata only, never payloads.
 // Disabled unless DEBUG_TOKEN is set; even then the token is required.
 app.get('/v1/debug', (c) => {
@@ -452,6 +546,7 @@ app.get('/v1/debug', (c) => {
       hasPushToken: Boolean(device.pushToken),
       hasWebPush: Boolean(device.pushSubscription),
       registeredAt: device.registeredAt,
+      lastSeen: device.lastSeen,
     })),
     blobs: [...blobs.values()].map((b) => ({
       id: b.id,
@@ -518,7 +613,8 @@ app.post('/v1/devices', async (c) => {
     pushToken: body.pushToken || existing?.pushToken || '',
     pushSubscription: rawSub !== undefined ? rawSub : existing?.pushSubscription ?? null,
     platform: body.platform,
-    registeredAt: Date.now(),
+    registeredAt: existing?.registeredAt ?? Date.now(),
+    lastSeen: Date.now(),
   });
   const device = devices.get(body.deviceId)!;
   console.log(
@@ -556,8 +652,9 @@ app.post('/v1/codes', async (c) => {
   if (c.req.header('x-cv-device') !== body.deviceId || !verifySigned(c, read.raw, device.signPub)) {
     return unauthorized(c);
   }
+  touchDevice(body.deviceId);
   const name = body.name.trim().slice(0, 40) || 'Friend';
-  const code = Array.from(randomBytes(8), (b) => CODE_ALPHABET[b % CODE_ALPHABET.length]).join('');
+  const code = randomPairingCode();
   pairingCodes.set(code, {
     code,
     payload: { v: 1, deviceId: body.deviceId, name, pub: body.pub },
@@ -606,6 +703,10 @@ app.post('/v1/blobs', async (c) => {
   if (c.req.header('x-cv-device') !== body.from || !verifySigned(c, read.raw, sender.signPub)) {
     return unauthorized(c);
   }
+  touchDevice(body.from);
+  if (!devices.has(body.to)) {
+    return c.json({ error: 'recipient is not registered' }, 404);
+  }
 
   const ttl =
     typeof body.ttlSeconds === 'number' && body.ttlSeconds > 0
@@ -631,10 +732,8 @@ app.post('/v1/blobs', async (c) => {
   console.log(
     `[deposit] kind=${body.kind} from=${body.from} to=${body.to} id=${record.id} ttl=${Math.round(ttl / 1000)}s`
   );
-  const pending = waiters.get(body.to);
-  if (pending && pending.length > 0) {
-    waiters.delete(body.to);
-    for (const wake of pending) wake();
+  if (wakeWaiters(body.to)) {
+    // Recipient is long-polling; no push needed.
   } else {
     // Recipient is not long-polling (app closed/locked): ping them via push.
     const recipient = devices.get(body.to);
@@ -659,6 +758,7 @@ app.get('/v1/blobs', async (c) => {
   if (c.req.header('x-cv-device') !== deviceId || !verifySigned(c, '', device.signPub)) {
     return unauthorized(c);
   }
+  touchDevice(deviceId);
   const take = (): BlobRecord[] => {
     const now = Date.now();
     const mine: BlobRecord[] = [];
@@ -684,35 +784,35 @@ app.get('/v1/blobs', async (c) => {
   }
 
   // Long-poll: register a waiter, re-check for races, then hold the request.
-  const list = waiters.get(deviceId) ?? [];
-  waiters.set(deviceId, list);
+  const ip = clientIp(c);
   const signal = c.req.raw.signal;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let wake: () => void = () => {};
+  let queued = false;
   const held = new Promise<boolean>((resolve) => {
     let finished = false;
-    const remove = () => {
-      const i = list.indexOf(wake);
-      if (i >= 0) list.splice(i, 1);
-      if (list.length === 0 && waiters.get(deviceId) === list) {
-        waiters.delete(deviceId);
-      }
-    };
     const finish = (hasBlob: boolean) => {
       if (finished) return;
       finished = true;
       if (timer) clearTimeout(timer);
-      remove();
+      removeWaiter(deviceId, wake);
       signal.removeEventListener('abort', abort);
       resolve(hasBlob);
     };
     const abort = () => finish(false);
     wake = () => finish(true);
     timer = setTimeout(() => wake(), LONG_POLL_TIMEOUT_MS);
-    list.push(wake);
+    queued = addWaiter(deviceId, ip, wake);
+    if (!queued) {
+      finish(false);
+      return;
+    }
     if (signal.aborted) abort();
     else signal.addEventListener('abort', abort, { once: true });
   });
+  if (!queued) {
+    return c.json({ error: 'too many waiting pickups' }, 503);
+  }
   const raced = take();
   if (raced.length > 0) {
     wake();
@@ -732,6 +832,7 @@ app.delete('/v1/blobs/:id', (c) => {
   if (!deviceId || !DEVICE_ID_RE.test(deviceId)) return unauthorized(c);
   const device = devices.get(deviceId);
   if (!device || !verifySigned(c, '', device.signPub)) return unauthorized(c);
+  touchDevice(deviceId);
   const id = c.req.param('id');
   const blob = blobs.get(id);
   if (!blob) return c.body(null, 404);
@@ -755,6 +856,15 @@ setInterval(() => {
       pairingCodes.delete(code);
     }
   }
+  for (const [id, device] of devices) {
+    if (
+      device.lastSeen + DEVICE_STALE_MS <= now &&
+      !pendingBlobs.has(id) &&
+      !waiters.has(id)
+    ) {
+      devices.delete(id);
+    }
+  }
 }, SWEEP_INTERVAL_MS).unref();
 
 const port = Number(process.env.PORT ?? 8787);
@@ -764,4 +874,5 @@ const port = Number(process.env.PORT ?? 8787);
 const hostname = process.env.HOST ?? '0.0.0.0';
 serve({ fetch: app.fetch, port, hostname }, (info) => {
   console.log(`cardvault-relay listening on ${info.family} ${info.address}:${info.port}`);
+  console.log(`[net] TRUST_PROXY=${TRUST_PROXY ? '1' : '0'} HOST=${hostname}`);
 });

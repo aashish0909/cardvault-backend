@@ -83,7 +83,11 @@ details/OTP, enable web push once.
 - All relay state is in-memory by design: a restart drops device
   registrations and pending blobs; clients re-register automatically on
   their next signed request (401 -> register -> retry).
-- VAPID keys come from the environment; `server/vapid.json` is dev-only and
-  must never be copied to the server.
+- VAPID keys **must** come from `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` in
+  production. `server/vapid.json` is generated for local dev only and must
+  never be copied to the server. Rotating VAPID keys invalidates existing
+  web-push subscriptions (clients re-subscribe on next unlock).
+- `TRUST_PROXY=1` is required behind Caddy so rate limits use the real client
+  IP. Leave it unset if the relay is reached directly.
 - Update flow: rebuild web -> rsync dist; relay: rsync server dir ->
   `sudo systemctl restart cardvault-relay`.

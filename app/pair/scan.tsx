@@ -12,7 +12,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { hexToBytes } from '../../lib/bytes';
-import { getIdentity } from '../../lib/identity';
+import { getIdentity, pairingFingerprint } from '../../lib/identity';
 import {
   PAIRING_CODE_LENGTH,
   resolvePairingCode,
@@ -49,10 +49,14 @@ export default function PairScanScreen() {
   const [permission, requestPermission] = useCameraPermissions();
   const [codeDraft, setCodeDraft] = useState('');
   const [codeFocused, setCodeFocused] = useState(false);
-  const [state, setState] = useState<'idle' | 'sending' | 'done' | 'error'>(
-    'idle'
-  );
+  const [state, setState] = useState<
+    'idle' | 'confirm' | 'sending' | 'done' | 'error'
+  >('idle');
   const [message, setMessage] = useState('');
+  const [pending, setPending] = useState<{
+    payload: PairPayload;
+    fingerprint: string;
+  } | null>(null);
   const codeInput = useRef<TextInput>(null);
 
   const handlePayload = async (raw: string) => {
@@ -62,9 +66,26 @@ export default function PairScanScreen() {
       setMessage('That code is not a valid CardVault pairing code.');
       return;
     }
+    const identity = await getIdentity();
+    if (parsed.deviceId === identity.deviceId) {
+      setState('error');
+      setMessage('That is your own code.');
+      return;
+    }
+    setPending({
+      payload: parsed,
+      fingerprint: await pairingFingerprint(parsed.pub),
+    });
+    setState('confirm');
+    setMessage('');
+  };
+
+  const confirmPair = async () => {
+    if (!pending || state === 'sending') return;
     setState('sending');
     try {
       const identity = await getIdentity();
+      const parsed = pending.payload;
       await upsertPeer({
         id: parsed.deviceId,
         name: parsed.name,
@@ -90,8 +111,7 @@ export default function PairScanScreen() {
 
   const onCodeSend = async () => {
     const code = codeDraft.trim();
-    if (code.length !== PAIRING_CODE_LENGTH || state === 'sending') return;
-    setState('sending');
+    if (code.length !== PAIRING_CODE_LENGTH || state !== 'idle') return;
     try {
       const payload = await resolvePairingCode(code);
       await handlePayload(JSON.stringify(payload));
@@ -123,7 +143,8 @@ export default function PairScanScreen() {
         <Text style={styles.title}>Scan a friend's QR</Text>
       </View>
 
-      {showCamera ? (
+      {state === 'idle' &&
+        (showCamera ? (
         <View style={styles.cameraBox}>
           <CameraView
             style={StyleSheet.absoluteFill}
@@ -137,7 +158,7 @@ export default function PairScanScreen() {
       ) : (
         <View style={styles.cameraFallback}>
           <Text style={styles.fallbackTitle}>
-            {state === 'idle' ? 'Camera not ready' : 'Scan complete'}
+            Camera not ready
           </Text>
           <Text style={styles.fallbackText}>
             {permission && !permission.granted && permission.canAskAgain ? (
@@ -150,12 +171,37 @@ export default function PairScanScreen() {
             )}
           </Text>
         </View>
+      ))}
+
+      {state === 'confirm' && pending && (
+        <View style={styles.manualBox}>
+          <Text style={styles.manualLabel}>
+            Compare this fingerprint with the number on {pending.payload.name}'s
+            screen. If they differ, do not pair.
+          </Text>
+          <Text style={styles.fingerprint}>{pending.fingerprint}</Text>
+          <View style={styles.confirmRow}>
+            <Pressable
+              style={styles.codeButton}
+              onPress={() => {
+                setPending(null);
+                setState('idle');
+              }}
+            >
+              <Text style={styles.codeButtonText}>Cancel</Text>
+            </Pressable>
+            <Pressable style={styles.acceptButton} onPress={() => void confirmPair()}>
+              <Text style={styles.acceptText}>Fingerprints match</Text>
+            </Pressable>
+          </View>
+        </View>
       )}
 
       {state === 'sending' && (
         <ActivityIndicator color={colors.accent} size="large" style={styles.spinner} />
       )}
 
+      {state === 'idle' && (
       <View style={styles.manualBox}>
         <Text style={styles.manualLabel}>Or enter their pairing code</Text>
         <Pressable style={styles.otpRow} onPress={() => codeInput.current?.focus()}>
@@ -211,6 +257,7 @@ export default function PairScanScreen() {
           <Text style={styles.sendButtonText}>Send pairing request</Text>
         </Pressable>
       </View>
+      )}
 
       {state === 'done' && (
         <View style={styles.doneBanner}>
@@ -371,6 +418,44 @@ const styles = StyleSheet.create({
   sendButtonText: {
     color: '#FFFFFF',
     fontSize: 16,
+    fontWeight: '600',
+  },
+  fingerprint: {
+    color: colors.text,
+    fontSize: 28,
+    fontWeight: '700',
+    letterSpacing: 4,
+    textAlign: 'center',
+    marginVertical: 16,
+    fontVariant: ['tabular-nums'],
+  },
+  confirmRow: {
+    flexDirection: 'row',
+    gap: 10,
+    justifyContent: 'center',
+  },
+  codeButton: {
+    backgroundColor: colors.surfaceAlt,
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  codeButtonText: {
+    color: colors.accent,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  acceptButton: {
+    backgroundColor: colors.accent,
+    borderRadius: 10,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  acceptText: {
+    color: '#FFFFFF',
+    fontSize: 14,
     fontWeight: '600',
   },
   doneBanner: {

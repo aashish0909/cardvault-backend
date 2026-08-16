@@ -23,6 +23,7 @@ import {
   setPeerStatus,
   SharedCardRow,
 } from '../../../lib/db';
+import { pairingFingerprint } from '../../../lib/identity';
 import { sendBlob, useInboxStore } from '../../../lib/relay';
 import { colors } from '../../../lib/theme';
 
@@ -235,6 +236,9 @@ export default function FriendsScreen() {
                     ? 'Waiting for them to accept'
                     : 'Wants to pair with you'}
                 </Text>
+                {item.section === 'incoming' && (
+                  <FingerprintLine pubHex={item.publicKey} />
+                )}
               </View>
               {item.section === 'incoming' ? (
                 <View style={styles.rowActions}>
@@ -255,6 +259,19 @@ export default function FriendsScreen() {
         }}
       />
     </View>
+  );
+}
+
+function FingerprintLine({ pubHex }: { pubHex: string }) {
+  const [value, setValue] = useState('');
+  useEffect(() => {
+    void pairingFingerprint(pubHex).then(setValue);
+  }, [pubHex]);
+  if (!value) return null;
+  return (
+    <Text style={styles.fingerprint}>
+      Fingerprint {value} — match this with their screen before accepting.
+    </Text>
   );
 }
 
@@ -344,6 +361,12 @@ const styles = StyleSheet.create({
     color: colors.muted,
     fontSize: 12,
     marginTop: 2,
+  },
+  fingerprint: {
+    color: colors.muted,
+    fontSize: 12,
+    marginTop: 6,
+    letterSpacing: 0.4,
   },
   rowActions: {
     flexDirection: 'row',
