@@ -131,10 +131,22 @@ export async function sendBlob(
       headers: { 'content-type': 'application/json', ...retry.headers },
       body: retry.body,
     });
-    if (!res2.ok) throw new Error(`Relay deposit failed: ${res2.status}`);
+    if (!res2.ok) {
+      throw new Error(
+        res2.status === 404
+          ? 'The other device is offline. Open CardVault there and try again.'
+          : `Relay deposit failed: ${res2.status}`
+      );
+    }
     return blobIdFrom(res2);
   }
-  if (!res.ok) throw new Error(`Relay deposit failed: ${res.status}`);
+  if (!res.ok) {
+    throw new Error(
+      res.status === 404
+        ? 'The other device is offline. Open CardVault there and try again.'
+        : `Relay deposit failed: ${res.status}`
+    );
+  }
   return blobIdFrom(res);
 }
 

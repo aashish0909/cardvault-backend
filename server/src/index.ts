@@ -704,9 +704,8 @@ app.post('/v1/blobs', async (c) => {
     return unauthorized(c);
   }
   touchDevice(body.from);
-  if (!devices.has(body.to)) {
-    return c.json({ error: 'recipient is not registered' }, 404);
-  }
+  // Hold the blob even if the recipient has not re-registered yet (relay
+  // restarts wipe in-memory device records). They pick it up on next poll.
 
   const ttl =
     typeof body.ttlSeconds === 'number' && body.ttlSeconds > 0
