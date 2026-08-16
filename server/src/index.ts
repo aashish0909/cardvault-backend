@@ -22,7 +22,8 @@ import { serve } from '@hono/node-server';
 import { getConnInfo } from '@hono/node-server/conninfo';
 import { Hono, type Context } from 'hono';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import nacl from 'tweetnacl';
 import webpush from 'web-push';
 
@@ -30,7 +31,7 @@ const MAX_PAYLOAD_BYTES = 64 * 1024; // encrypted blobs are small; 64 KB is gene
 const MAX_BODY_BYTES = 128 * 1024; // hard cap on any request body (memory DoS)
 const MAX_BLOBS_PER_DEVICE = 200; // inbox cap per recipient (memory exhaustion)
 const MAX_DEVICES = 10_000; // total registered devices cap
-const DEVICE_STALE_MS = 7 * 24 * 60 * 60 * 1000; // drop unused registrations after 7d
+const DEVICE_STALE_MS = 7 * 24 * 60 * 60 * 1000; // drop unused *non-push* registrations after 7d
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
 const MAX_TTL_MS = 48 * 60 * 60 * 1000; // 48 h
 const SWEEP_INTERVAL_MS = 60 * 1000;
@@ -162,6 +163,10 @@ function touchDevice(deviceId: string): void {
   if (device) device.lastSeen = Date.now();
 }
 
+function isPushable(device: DeviceRecord): boolean {
+  return Boolean(device.pushToken || device.pushSubscription);
+}
+
 function randomPairingCode(): string {
   // Rejection sampling so every alphabet character is equally likely.
   const out: string[] = [];
@@ -179,9 +184,75 @@ function randomPairingCode(): string {
 // persisted to vapid.json (0600), and reused on restart so stored
 // subscriptions keep working. The public key is served to browsers so they
 // can subscribe.
-const VAPID_SUBJECT = 'mailto:relay@cardvault.local';
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:relay@cardvault.local';
 const VAPID_FILE = new URL('../vapid.json', import.meta.url).pathname;
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+// Device registrations (including web-push subscriptions) survive relay
+// restarts. Blobs stay in-memory: they are short-lived mail, not an account.
+const STATE_DIR = process.env.STATE_DIRECTORY || process.env.STATE_DIR || dirname(VAPID_FILE);
+const DEVICES_FILE = join(STATE_DIR, 'devices.json');
+
+function persistDevices(): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    const rows = [...devices.entries()].map(([deviceId, d]) => ({
+      deviceId,
+      signPub: d.signPub,
+      pushToken: d.pushToken,
+      pushSubscription: d.pushSubscription,
+      platform: d.platform,
+      registeredAt: d.registeredAt,
+      lastSeen: d.lastSeen,
+    }));
+    const tmp = `${DEVICES_FILE}.tmp`;
+    writeFileSync(tmp, JSON.stringify(rows), { mode: 0o600 });
+    renameSync(tmp, DEVICES_FILE);
+  } catch (err) {
+    console.error(`[devices] persist failed: ${(err as Error).message}`);
+  }
+}
+
+function loadDevices(): void {
+  try {
+    if (!existsSync(DEVICES_FILE)) return;
+    const raw = JSON.parse(readFileSync(DEVICES_FILE, 'utf8')) as unknown;
+    if (!Array.isArray(raw)) return;
+    for (const row of raw) {
+      if (!row || typeof row !== 'object') continue;
+      const r = row as Record<string, unknown>;
+      if (typeof r.deviceId !== 'string' || !DEVICE_ID_RE.test(r.deviceId)) continue;
+      if (typeof r.signPub !== 'string' || !SIGN_PUB_RE.test(r.signPub)) continue;
+      if (r.platform !== 'ios' && r.platform !== 'android' && r.platform !== 'web') continue;
+      let sub: PushSubscriptionRecord | null = null;
+      if (r.pushSubscription && typeof r.pushSubscription === 'object') {
+        const s = r.pushSubscription as Record<string, unknown>;
+        const keys = s.keys as Record<string, unknown> | undefined;
+        if (
+          typeof s.endpoint === 'string' &&
+          keys &&
+          typeof keys.p256dh === 'string' &&
+          typeof keys.auth === 'string'
+        ) {
+          sub = {
+            endpoint: s.endpoint,
+            keys: { p256dh: keys.p256dh, auth: keys.auth },
+          };
+        }
+      }
+      devices.set(r.deviceId, {
+        signPub: r.signPub.toLowerCase(),
+        pushToken: typeof r.pushToken === 'string' ? r.pushToken : '',
+        pushSubscription: sub,
+        platform: r.platform,
+        registeredAt: typeof r.registeredAt === 'number' ? r.registeredAt : Date.now(),
+        lastSeen: typeof r.lastSeen === 'number' ? r.lastSeen : Date.now(),
+      });
+    }
+    console.log(`[devices] restored ${devices.size} registration(s) from ${DEVICES_FILE}`);
+  } catch (err) {
+    console.error(`[devices] load failed: ${(err as Error).message}`);
+  }
+}
 
 function loadVapidKeys(): { publicKey: string; privateKey: string } {
   const fromEnv =
@@ -218,6 +289,7 @@ if (!vapidFromEnv && (process.env.HOST === '127.0.0.1' || process.env.NODE_ENV =
     '[vapid] VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY are unset; file-based keys are for local dev only'
   );
 }
+loadDevices();
 
 // Push copy for the kinds that warrant waking the user. Everything here is
 // public metadata (kind is visible to the relay anyway); the payload itself is
@@ -244,8 +316,12 @@ async function pushToDevice(device: DeviceRecord, kind: string): Promise<void> {
     body: 'New activity - open the app to review.',
   };
   if (text === null) return;
+  const payload = JSON.stringify({ ...text, kind });
   if (device.platform !== 'web') {
-    if (!device.pushToken) return;
+    if (!device.pushToken) {
+      console.warn(`[push] platform=${device.platform} kind=${kind} skipped: no expo token`);
+      return;
+    }
     try {
       const res = await fetch(EXPO_PUSH_URL, {
         method: 'POST',
@@ -265,7 +341,10 @@ async function pushToDevice(device: DeviceRecord, kind: string): Promise<void> {
       } | null;
       if (!res.ok) throw new Error(`Expo push failed: ${res.status}`);
       if (result?.data?.status === 'error') {
-        if (result.data.details?.error === 'DeviceNotRegistered') device.pushToken = '';
+        if (result.data.details?.error === 'DeviceNotRegistered') {
+          device.pushToken = '';
+          persistDevices();
+        }
         throw new Error(result.data.message ?? 'Expo push rejected');
       }
       console.log(`[push] platform=${device.platform} kind=${kind} delivered`);
@@ -274,16 +353,24 @@ async function pushToDevice(device: DeviceRecord, kind: string): Promise<void> {
     }
     return;
   }
-  if (!device.pushSubscription) return;
+  if (!device.pushSubscription) {
+    console.warn(`[push] kind=${kind} skipped: no web-push subscription`);
+    return;
+  }
   try {
-    await webpush.sendNotification(device.pushSubscription, JSON.stringify(text), {
-      TTL: 60 * 60, // 1 h: long enough for the owner to return, no longer
+    await webpush.sendNotification(device.pushSubscription, payload, {
+      // Long enough that a briefly-offline phone still gets the banner;
+      // OTP/details windows are shorter, so the user still has to open the app.
+      TTL: 4 * 60 * 60,
+      urgency: 'high',
     });
     console.log(`[push] kind=${kind} delivered`);
   } catch (err) {
     const code = (err as { statusCode?: number }).statusCode;
     if (code === 404 || code === 410) {
       device.pushSubscription = null; // push service dropped the subscription
+      persistDevices();
+      console.warn(`[push] kind=${kind} subscription gone (${code}); cleared`);
     } else {
       console.error(`[push] kind=${kind} failed: ${(err as Error).message}`);
     }
@@ -616,6 +703,7 @@ app.post('/v1/devices', async (c) => {
     registeredAt: existing?.registeredAt ?? Date.now(),
     lastSeen: Date.now(),
   });
+  persistDevices();
   const device = devices.get(body.deviceId)!;
   console.log(
     `[device] registered id=${body.deviceId} platform=${body.platform} ` +
@@ -731,13 +819,14 @@ app.post('/v1/blobs', async (c) => {
   console.log(
     `[deposit] kind=${body.kind} from=${body.from} to=${body.to} id=${record.id} ttl=${Math.round(ttl / 1000)}s`
   );
-  if (wakeWaiters(body.to)) {
-    // Recipient is long-polling; no push needed.
-  } else {
-    // Recipient is not long-polling (app closed/locked): ping them via push.
-    const recipient = devices.get(body.to);
-    if (recipient) void pushToDevice(recipient, body.kind);
-  }
+  // Always ping via push. A live long-poll still gets the blob instantly, but
+  // iOS PWAs often look "connected" for ~25s after the user leaves the app
+  // (zombie waiter), and skipping push in that window drops the lock-screen
+  // banner. Foreground clients already show an in-app toast; a duplicate OS
+  // banner is better than a missed OTP request.
+  wakeWaiters(body.to);
+  const recipient = devices.get(body.to);
+  if (recipient) void pushToDevice(recipient, body.kind);
   return c.json({ id: record.id, expiresAt: record.expiresAt }, 201);
 });
 
@@ -834,7 +923,7 @@ app.delete('/v1/blobs/:id', (c) => {
   touchDevice(deviceId);
   const id = c.req.param('id');
   const blob = blobs.get(id);
-  if (!blob) return c.body(null, 404);
+  if (!blob) return c.body(null, 204);
   if (blob.to !== deviceId && blob.from !== deviceId) {
     return c.json({ error: 'not your blob' }, 403);
   }
@@ -855,15 +944,19 @@ setInterval(() => {
       pairingCodes.delete(code);
     }
   }
+  let devicesDirty = false;
   for (const [id, device] of devices) {
     if (
       device.lastSeen + DEVICE_STALE_MS <= now &&
       !pendingBlobs.has(id) &&
-      !waiters.has(id)
+      !waiters.has(id) &&
+      !isPushable(device)
     ) {
       devices.delete(id);
+      devicesDirty = true;
     }
   }
+  if (devicesDirty) persistDevices();
 }, SWEEP_INTERVAL_MS).unref();
 
 const port = Number(process.env.PORT ?? 8787);
@@ -875,3 +968,10 @@ serve({ fetch: app.fetch, port, hostname }, (info) => {
   console.log(`cardvault-relay listening on ${info.family} ${info.address}:${info.port}`);
   console.log(`[net] TRUST_PROXY=${TRUST_PROXY ? '1' : '0'} HOST=${hostname}`);
 });
+
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(sig, () => {
+    persistDevices();
+    process.exit(0);
+  });
+}
