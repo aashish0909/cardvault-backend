@@ -392,6 +392,8 @@ export default function RequestsScreen() {
                 placeholder="123456"
                 placeholderTextColor={colors.muted}
                 keyboardType="number-pad"
+                textContentType="oneTimeCode"
+                autoComplete="one-time-code"
                 maxLength={8}
                 autoFocus
               />
